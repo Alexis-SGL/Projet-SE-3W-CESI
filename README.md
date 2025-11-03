@@ -45,3 +45,5 @@ Une startup partenaire a été choisie pour la **conception du prototype**.
 - GPS (UART)
 - Luminosité (analogique)
 
+![Photo-Montage-CarteArduino](https://github.com/user-attachments/assets/112b3599-1fb2-40b1-9728-387c1b513694)
+
