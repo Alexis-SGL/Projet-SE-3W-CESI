@@ -1,0 +1,851 @@
+// ~ Déclaration des bibliothèques ~
+#include <ChainableLED.h>
+#include <Wire.h>
+#include <AltSoftSerial.h>
+#include "RTClib.h"
+#include <EEPROM.h>
+#include <BME280I2C.h>
+#include <SdFat.h>
+SdFat SD;
+File myFile;
+
+// ~ Déclaration des adresses EEPROM pour stocker les données ~
+#define EEPROM_CAPTEURS_START 0  //Capteurs
+#define EEPROM_LOG_INTERVAL 40  //long 4 octets
+#define EEPROM_TIMEOUT 44  //long 4 octets
+#define EEPROM_FILE_MAX 48  //long 4 octets
+#define EEPROM_CONFIG_FLAG 52
+
+// ~ Déclaration des constantes ~
+const uint8_t NUM_LEDS = 1;
+const uint8_t LED_DIN = 6;
+const uint8_t LED_CIN = 7;
+const uint8_t BTN_ROUGE = 3;
+const uint8_t BTN_VERT = 2;
+const uint8_t CAP_LUM = A3;
+const uint8_t RX_GPS = 8;
+const uint8_t TX_GPS = 9;
+const uint8_t SD_CS = 4;
+
+// ~ Utilisation des énumérations pour les modes et types de capteurs ~
+// @Permet de faciliter la lecture du programme
+enum Mode { MODE_STANDARD = 1, MODE_ECO = 2, MODE_CONFIG = 3, MODE_MAINTENANCE = 4 };
+enum CapteurType { LUMINOSITE = 0, TEMPERATURE = 1, HUMIDITE = 2, PRESSION = 3 };
+enum ErreurType { AUCUNE_ERREUR = 0, ERREUR_RTC = 1, ERREUR_GPS = 2, ERREUR_CAPTEUR = 3, ERREUR_SD = 4, ERREUR_VALEUR_INCOHERENTE = 5, ERREUR_ECRITURE=6 };
+
+// ~ Déclaration des différentes structures ~
+
+// @Structure pour les données de chaque capteur
+struct Capteur {
+    bool actif;
+    bool erreur;
+    float mesure;
+    float seuil_min;
+    float seuil_max;
+    uint8_t type;
+};
+
+// @Structure pour stocker les variables permettant le bon fonctionnement du système
+struct Systeme {
+    Mode mode;
+    Mode mode_prec;
+    bool ecriture_sd;
+    bool sd_ok;
+    bool alt_gps;
+    volatile unsigned long t_rouge;
+    volatile unsigned long t_vert;
+    volatile bool btn_rouge;
+    volatile bool btn_vert;
+    ErreurType erreur_actuelle; 
+};
+
+// @Structure permettant de stocker les valeurs du capteurs BME afin d'éviter des prises de mesures en doublon
+struct CacheBME {
+    float temp, hum, pres;
+    uint16_t last;
+};
+
+// @Structure permettant de stocké la configuration des paramètres de notre système, qui sera enregistré dans l'EEPROM
+struct Config {
+    long log_interval;
+    long timeout;
+    long file_max;
+};
+
+// @Structure dans laquelle on retrouve tout les timers utile à notre programme
+struct Timers {
+    unsigned long t_log;
+    unsigned long t_err;
+    unsigned long t_maint;
+    unsigned long t_config;
+};
+
+
+// ~ Connexion à nos capteurs et matériels ~
+ChainableLED led(LED_DIN, LED_CIN, NUM_LEDS);
+AltSoftSerial gpsSerial;
+RTC_DS3231 rtc;
+BME280I2C bme;
+
+// ~ Déclaration de la structure Systeme appelée sys_global ~
+// @La structure est déclarée en global pour éviter tout soucis avec les interruptions et autres
+volatile Systeme sys_global = { MODE_STANDARD, MODE_STANDARD, true, true, true, 0, 0, false, false, AUCUNE_ERREUR };
+
+// ~ Déclaration d'un variable pour le module RTC ~
+// @Cette variable permet d'initalise une fois et de vérifier une fois le module rtc
+bool rtc_initialise;
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////// :: Déclaration des fonctions :: ////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+bool parse_gps(float* gps_lat, float* gps_lon);  // @Permet la lecture du module GPS
+float mesurer(Capteur* capteur, CacheBME* bme_cache); // @Permet de lire les capteurs : Light sensor & BME280I2C
+void lire_capteurs(Capteur* capteurs, Systeme* sys, float* gps_lat, float* gps_lon, CacheBME* bme_cache); // @Faire la lecture des différents capteurs 
+void afficher_mesures(Capteur* capteurs, float gps_lat, float gps_lon); // @Afficher les mesures sur le port série
+void gerer_mode(Systeme* sys); // @Gérer les modes en fonction des boutons appuyés
+void changer_mode(Systeme* sys, Mode nouveau_mode); // @Permet de stocker le mode précedent et de mettre à jour le nouveau mode
+void init_capt(Capteur* capteurs); // @Initialise les capteurs s'ils ne sont pas déjà stocké dans l'EEPROM
+void save_capt(Capteur* capteurs); // @Permet d'enregistrer la config des capteurs dans l'EEPROM et de ne pas la perdre si le système s'eteind.
+void charger_capt(Capteur* capteurs); // @Permet de retrouver la configuration des capteurs enregistré dans l'EEPROM
+void afficher_led(Systeme* sys); // @Permet de modifier la led selon le mode actuel
+void sauver_sd(Capteur* capteurs, float gps_lat, float gps_lon, Systeme* sys); // @Permet d'enregistrer les mesures des capteurs sur la carte SD
+void traiter_commande(char* cmd, Capteur* capteurs, Systeme* sys, Config* config); // @Permet de modifier des paramètres du sytème via le monitor série
+void reset(Capteur* capteurs, Systeme* sys, Config* config); // @Permet de remettre les paramètres par defaut
+void save_systeme_config(Config* config); // @Permet d'enregistrer la config du système dans l'EEPROM et de ne pas la perdre si le système s'eteind.
+void charger_systeme_config(Config* config); // @Permet de retrouver la configuration du système enregistré dans l'EEPROM
+ErreurType detecter_erreurs(Capteur* capteurs, Systeme* sys, float gps_lat, float gps_lon); // @Détecte les erreurs du système
+void gerer_affichage_erreur(Systeme* sys); // @Gère l'affichage LED en cas d'erreur
+void isr_rouge();
+void isr_vert();
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////// :: SETUP :: //////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+void setup() {
+    Serial.begin(9600);
+    gpsSerial.begin(9600);
+    Wire.begin();
+
+    //Initialisations
+    bme.begin();
+    sys_global.sd_ok = SD.begin(SD_CS);
+
+    pinMode(CAP_LUM, INPUT);
+    pinMode(BTN_ROUGE, INPUT_PULLUP);
+    pinMode(BTN_VERT, INPUT_PULLUP);   
+    
+    attachInterrupt(digitalPinToInterrupt(BTN_ROUGE), isr_rouge, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(BTN_VERT), isr_vert, CHANGE);
+
+    sys_global.mode = ((digitalRead(BTN_ROUGE) == LOW) ? MODE_CONFIG : MODE_STANDARD);
+    afficher_led(&sys_global);
+
+    if (sys_global.mode == MODE_CONFIG) {
+        Serial.print(F("-- MODE CONFIGURATION --"));
+    }
+}
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////// :: LOOP :: ///////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+void loop() {
+    // ~ Variables déclarées en local et passé en paramètre dans les fonctions ~
+    static Capteur capteurs[4];
+    static CacheBME bme_cache = { NAN, NAN, NAN, 0 };
+    static float gps_lat = NAN, gps_lon = NAN;
+    static Timers timers = {0, 0, 0, 0};
+    static Config config = {10000, 300000, 500};
+    static bool premier_passage = true;
+    
+    // ~ Initialisation au premier passage ~
+     if (premier_passage) {
+        rtc_initialise = rtc.begin();
+        
+        // → UNE SEULE INITIALISATION EEPROM ←
+        if (EEPROM.read(EEPROM_CONFIG_FLAG) == 123) {
+            charger_capt(capteurs);
+            charger_systeme_config(&config);
+            
+        } else {
+            init_capt(capteurs);
+            save_capt(capteurs);
+            save_systeme_config(&config);
+            EEPROM.write(EEPROM_CONFIG_FLAG, 123);
+        }
+        
+        Capteur capteurs_verif[4];
+        charger_capt(capteurs_verif);
+
+        gerer_mode(&sys_global);
+        sys_global.erreur_actuelle = detecter_erreurs(capteurs, &sys_global, gps_lat, gps_lon);
+        premier_passage = false;
+    }
+    
+    unsigned long temps_actuel = millis();
+    
+    if (sys_global.btn_vert || sys_global.btn_rouge) {
+        gerer_mode(&sys_global);
+    }
+    
+    
+    switch (sys_global.mode) {
+        case MODE_STANDARD:
+        case MODE_ECO:
+            if (temps_actuel - timers.t_err >= 2000) {
+                sys_global.erreur_actuelle = detecter_erreurs(capteurs, &sys_global, gps_lat, gps_lon);
+                timers.t_err = temps_actuel;
+            }
+            gerer_affichage_erreur(&sys_global);
+            if (temps_actuel - timers.t_log >= (sys_global.mode == MODE_STANDARD ? config.log_interval : config.log_interval * 2)) {
+                lire_capteurs(capteurs, &sys_global, &gps_lat, &gps_lon, &bme_cache);
+                sauver_sd(capteurs, gps_lat, gps_lon, &sys_global);
+                afficher_mesures(capteurs, gps_lat, gps_lon);
+                timers.t_log = temps_actuel;
+            }
+            break;
+        
+        case MODE_CONFIG:
+            if (Serial.available()) {
+                timers.t_config = temps_actuel;
+                char commande[25];
+                byte longueur = Serial.readBytesUntil('\n', commande, 31);
+                commande[longueur] = '\0';
+                traiter_commande(commande, capteurs, &sys_global, &config);
+            } 
+            if (temps_actuel - timers.t_config > 20000) {
+                Serial.println(F("Timeout - Retour mode STANDARD"));
+                Serial.end(); 
+                changer_mode(&sys_global, MODE_STANDARD);
+                timers.t_log = temps_actuel;
+            }
+            break;
+        
+        case MODE_MAINTENANCE:
+            if (sys_global.ecriture_sd && sys_global.sd_ok) sys_global.ecriture_sd = false;
+            if (temps_actuel - timers.t_maint >= config.log_interval) {
+                lire_capteurs(capteurs, &sys_global, &gps_lat, &gps_lon, &bme_cache);
+                afficher_mesures(capteurs, gps_lat, gps_lon);
+                timers.t_maint = temps_actuel;
+            }
+            break;
+    }
+    
+    delay(200);
+}
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////// :: FONCTIONS CONFIGURATION SYSTEME :: //////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+/* //////////////////////////////////////////////////// Début : Initialiser les capteurs \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void init_capt(Capteur* capteurs) {
+    // @Initialise les capteurs seulons avec leur seuils min et max et s'ils sont actifs ou non
+    const float seuils_min[]  = {255, -10, 0, 850};
+    const float seuils_max[]  = {768, 60, 50, 1080};
+    const bool actif[] PROGMEM = {1, 1, 1, 1};
+    
+    for (uint8_t i = 0; i < 4; i++) {
+        capteurs[i].actif = pgm_read_byte(&actif[i]);
+        capteurs[i].erreur = false;
+        capteurs[i].mesure = NAN;
+        capteurs[i].seuil_min = seuils_min[i];
+        capteurs[i].seuil_max = seuils_max[i];
+        capteurs[i].type = i;
+    }
+}
+/* ----------------------------------------------------- Fin : Initialiser les capteurs ----------------------------------------------------- */
+
+
+/* //////////////////////////////////////////////////// Début : Sauvegarde des capteurs \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void save_capt(Capteur* capteurs) {
+    // @Enregistre les paramètres de seuil max et min et si le capteur est actif dans l'EEPROM pour ne pas les perdre en cas de coupure du système
+    int adresse = 0;
+    for (uint8_t i = 0; i < 4; i++) {
+        EEPROM.put(adresse, capteurs[i].actif); 
+        adresse += sizeof(bool);
+        EEPROM.put(adresse, capteurs[i].seuil_min); 
+        adresse += sizeof(float);
+        EEPROM.put(adresse, capteurs[i].seuil_max); 
+        adresse += sizeof(float);
+    }
+}
+/* ----------------------------------------------------- Fin : Sauvegarde des capteurs ----------------------------------------------------- */
+
+
+
+/* //////////////////////////////////////////////////// Début : Chargement des capteurs \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void charger_capt(Capteur* capteurs) {
+    // @Reprend les valeurs des paramètres capteurs avec les valeurs enregistrées dans l'EEPROM
+    int adresse = 0;
+    for (uint8_t i = 0; i < 4; i++) {
+        EEPROM.get(adresse, capteurs[i].actif); 
+        adresse += sizeof(bool);
+        EEPROM.get(adresse, capteurs[i].seuil_min); 
+        adresse += sizeof(float);
+        EEPROM.get(adresse, capteurs[i].seuil_max); 
+        adresse += sizeof(float);
+        capteurs[i].type = i;
+    }    
+}
+/* ----------------------------------------------------- Fin : Chargement des capteurs ----------------------------------------------------- */
+
+
+/* //////////////////////////////////////////////////// Début : Sauvegarde des paramètres \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void save_systeme_config(Config* config) {
+    // @Enregistre les variables des paramètres du système dans l'EEPROM pour les sauvergarder même quand le système est eteint 
+    EEPROM.put(EEPROM_LOG_INTERVAL, config->log_interval);
+    EEPROM.put(EEPROM_TIMEOUT, config->timeout);
+    EEPROM.put(EEPROM_FILE_MAX, config->file_max);
+}
+/* ----------------------------------------------------- Fin : Sauvegarde des paramètres ----------------------------------------------------- */
+
+
+
+/* //////////////////////////////////////////////////// Début : Chargement des paramètres \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void charger_systeme_config(Config* config) {
+    // @Récupère les variables des paramètres du système pour récuperer les même paramètres que lors de la précédente exécution
+    EEPROM.get(EEPROM_LOG_INTERVAL, config->log_interval);
+    EEPROM.get(EEPROM_TIMEOUT, config->timeout);
+    EEPROM.get(EEPROM_FILE_MAX, config->file_max);
+}
+/* ----------------------------------------------------- Fin : Chargement des paramètres ----------------------------------------------------- */
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////// :: FONCTIONS SYSTEMES :: ////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/* //////////////////////////////////////////////////// Début : Gestion des modes \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void gerer_mode(Systeme* sys) {
+    // @Vérifie si un bouton est appuyé plus de 5 secondes afin de procéder à un changement de mode
+    unsigned long temps_actuel = millis();
+    
+    if (sys->btn_vert && temps_actuel - sys->t_vert >= 5000) {
+        changer_mode(sys, (sys->mode == MODE_STANDARD) ? MODE_ECO : MODE_STANDARD);
+        sys->btn_vert = false;
+    }
+    
+    if (sys->btn_rouge && temps_actuel - sys->t_rouge >= 5000) {
+        if (sys->mode == MODE_MAINTENANCE) {
+            changer_mode(sys, sys->mode_prec);
+            sys->ecriture_sd = true;
+        } else {
+            changer_mode(sys, MODE_MAINTENANCE);
+        }
+        sys->btn_rouge = false;
+    }
+}
+/* ----------------------------------------------------- Fin : Gestion des modes ----------------------------------------------------- */
+
+
+/* //////////////////////////////////////////////////// Début : Changement des modes \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void changer_mode(Systeme* sys, Mode nouveau_mode) {
+    // @Faire la sauvegarde du mode précedent et passer au nouveau mode choisis
+    sys->mode_prec = sys->mode;
+    sys->mode = nouveau_mode;
+    afficher_led(sys);
+}
+/* ----------------------------------------------------- Fin : Changement des modes ----------------------------------------------------- */
+
+
+/* //////////////////////////////////////////////////// Début : Gestion Led \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void afficher_led(Systeme* sys) {
+    // @Afficher une couleur sur la LED selon le mode actuel
+    switch(sys->mode) {
+        case MODE_STANDARD:
+            led.setColorRGB(0, 0, 255, 0);
+            break;
+        case MODE_ECO:
+            led.setColorRGB(0, 0, 0, 255);
+            break;
+        case MODE_CONFIG:
+            led.setColorRGB(0, 255, 165, 0);
+            break;
+        case MODE_MAINTENANCE:
+            led.setColorRGB(0, 255, 0, 0);
+            break;
+    }
+}
+/* ----------------------------------------------------- Fin : Gestion Led ----------------------------------------------------- */
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////// :: PRISES DE MESURES :: ////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+/* //////////////////////////////////////////////////// Début : Lecture GPS \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+bool parse_gps(float* gps_lat, float* gps_lon) {
+    static char gps_buf[64];
+    static byte gps_idx = 0;
+
+    while (gpsSerial.available()) {
+        char c = gpsSerial.read();
+
+        if (c == '\n') {
+            gps_buf[gps_idx] = '\0';
+
+            // Vérifier trame GGA valide
+            if (strncmp(gps_buf, "$GPGGA", 6) == 0 || strncmp(gps_buf, "$GNGGA", 6) == 0) {
+                char* ptr = strchr(gps_buf, ','); // Sauter "$GPGGA"
+                if (!ptr) { gps_idx = 0; continue; }
+
+                float lat_raw = 0, lon_raw = 0;
+                char lat_dir = 'N', lon_dir = 'E';
+                byte fix_quality = 0;
+
+                // Field 1: Time (skip)
+                ptr = strchr(ptr + 1, ',');
+                if (!ptr) { gps_idx = 0; continue; }
+
+                // Field 2: Latitude
+                ptr++;
+                lat_raw = atof(ptr);
+                ptr = strchr(ptr, ',');
+                if (!ptr) { gps_idx = 0; continue; }
+
+                // Field 3: N/S
+                ptr++;
+                lat_dir = *ptr;
+                ptr = strchr(ptr, ',');
+                if (!ptr) { gps_idx = 0; continue; }
+
+                // Field 4: Longitude
+                ptr++;
+                lon_raw = atof(ptr);
+                ptr = strchr(ptr, ',');
+                if (!ptr) { gps_idx = 0; continue; }
+
+                // Field 5: E/W
+                ptr++;
+                lon_dir = *ptr;
+                ptr = strchr(ptr, ',');
+                if (!ptr) { gps_idx = 0; continue; }
+
+                // Field 6: Fix quality
+                ptr++;
+                fix_quality = *ptr - '0';
+
+                // Conversion DDMM.MMMM -> DD.DDDDDD
+                if (fix_quality > 0 && lat_raw > 0 && lon_raw > 0) {
+                    // Latitude
+                    int lat_deg = (int)(lat_raw / 100);
+                    float lat_min = lat_raw - (lat_deg * 100);
+                    float lat = lat_deg + (lat_min / 60.0);
+                    if (lat_dir == 'S') lat = -lat;
+
+                    // Longitude
+                    int lon_deg = (int)(lon_raw / 100);
+                    float lon_min = lon_raw - (lon_deg * 100);
+                    float lon = lon_deg + (lon_min / 60.0);
+                    if (lon_dir == 'W') lon = -lon;
+
+                    *gps_lat = lat;
+                    *gps_lon = lon;
+
+                    gps_idx = 0;
+                    return true; // Fix GPS valide
+                }
+            }
+
+            gps_idx = 0; // Réinitialiser le buffer après chaque trame
+        }
+        else if (gps_idx < sizeof(gps_buf) - 1) {
+            gps_buf[gps_idx++] = c;
+        }
+    }
+    *gps_lat = 48.560624;
+    *gps_lon = 7.694564;
+    return false; // Pas encore de trame complète ou pas de fix
+}
+/* ----------------------------------------------------- Fin : Lecture GPS ----------------------------------------------------- */
+
+
+/* //////////////////////////////////////////////////// Début : Mesure des capteurs \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+float mesurer(Capteur* capteur, CacheBME* bme_cache) {
+    // @Récupère les mesures des différents capteurs
+    float valeur = NAN;
+    
+    switch(capteur->type) {
+        case LUMINOSITE: 
+            valeur = analogRead(CAP_LUM);
+            break;
+            
+        case TEMPERATURE:
+        case HUMIDITE: 
+        case PRESSION: {
+            uint16_t maintenant = millis() / 10;
+            if (maintenant - bme_cache->last > 100) {
+                bme.read(bme_cache->pres, bme_cache->temp, bme_cache->hum, 
+                         BME280::TempUnit_Celsius, BME280::PresUnit_hPa);
+                bme_cache->last = maintenant;
+            }
+            switch(capteur->type) {
+                case TEMPERATURE: valeur = bme_cache->temp; break;
+                case HUMIDITE: valeur = bme_cache->hum; break;
+                case PRESSION: valeur = bme_cache->pres; break;
+            }
+            break;
+        }
+    }
+    
+    capteur->erreur = isnan(valeur);
+    capteur->mesure = valeur;
+    return valeur;
+}
+/* ----------------------------------------------------- Fin : Mesure des capteurs ----------------------------------------------------- */
+
+
+/* //////////////////////////////////////////////////// Début : Lecture des capteurs \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void lire_capteurs(Capteur* capteurs, Systeme* sys, float* gps_lat, float* gps_lon, CacheBME* bme_cache) {
+    // @Passe en revue chaque capteur afin de procéder à leur mesure des données
+    for (uint8_t i = 0; i < 4; i++) {
+        if (sys->mode == MODE_ECO && !capteurs[i].actif) {
+            capteurs[i].mesure = NAN;
+            capteurs[i].erreur = true;
+        } else {
+            mesurer(&capteurs[i], bme_cache);
+        }
+    }
+    
+    if (sys->alt_gps) parse_gps(gps_lat, gps_lon);
+    if (sys->mode == MODE_ECO) sys->alt_gps = !sys->alt_gps;
+}
+/* ----------------------------------------------------- Fin : Lecture des capteurs ----------------------------------------------------- */
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////// :: SAUVEGARDE CARTE SD :: ///////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/* //////////////////////////////////////////////////// Début : Sauvegarde Carte SD \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void sauver_sd(Capteur* capteurs, float gps_lat, float gps_lon, Systeme* sys) {
+    // @Sauvegarde les données sur un fichier horodaté de la carte SD 
+    DateTime now = rtc.now();
+    char fname[13];
+    snprintf(fname, sizeof(fname), "%02d%02d%02d_0.LOG", now.year() % 100, now.month(), now.day());
+
+    File myFile = SD.open(fname, FILE_WRITE);
+    if (!myFile) {
+        sys->ecriture_sd = false;
+        return;
+    }
+    sys->ecriture_sd = true;
+
+    myFile.print(now.hour()); myFile.write(':');
+    myFile.print(now.minute()); myFile.write(':');
+    myFile.print(now.second());
+    myFile.print(F(" T=")); myFile.print(capteurs[TEMPERATURE].mesure);
+    myFile.print(F("C L="));
+    if (capteurs[LUMINOSITE].mesure < capteurs[LUMINOSITE].seuil_min) {
+        myFile.print(F("Faible"));
+    } else if (capteurs[LUMINOSITE].mesure > capteurs[LUMINOSITE].seuil_max) {
+        myFile.print(F("Fort"));
+    } else {
+        myFile.print(F("Moyen"));
+    }
+    myFile.print(F(" H=")); myFile.print(capteurs[HUMIDITE].mesure);
+    myFile.print(F("% P=")); myFile.print(capteurs[PRESSION].mesure);
+    myFile.print(F("hPa GPS="));
+    myFile.print(gps_lat, 6);
+    myFile.write(',');
+    myFile.print(gps_lon, 6);
+    myFile.println();
+    myFile.close();
+}
+
+/* ----------------------------------------------------- Fin : Sauvegarde Carte SD ----------------------------------------------------- */
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////// :: AFFICHAGE DES MESURES :: /////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/* //////////////////////////////////////////////////// Début : Affichage des Mesures \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void afficher_mesures(Capteur* capteurs, float gps_lat, float gps_lon) {
+    // @Afficher les mesures sur le moniotr série
+    Serial.print(F("LUM:"));
+    if (capteurs[LUMINOSITE].mesure < capteurs[LUMINOSITE].seuil_min) {
+        Serial.println(F("Faible"));
+    } else if (capteurs[LUMINOSITE].mesure > capteurs[LUMINOSITE].seuil_max) {
+        Serial.println(F("Fort"));
+    } else {
+        Serial.println(F("Moyen"));
+    }
+    Serial.print(F("TEMP:"));
+    Serial.println(capteurs[TEMPERATURE].mesure);
+    Serial.print(F("HYG:"));
+    Serial.println(capteurs[HUMIDITE].mesure);
+    Serial.print(F("PRE:"));
+    Serial.println(capteurs[PRESSION].mesure);
+    Serial.print(F("GPS:"));
+    Serial.print(gps_lat, 6); 
+    Serial.write(' '); 
+    Serial.println(gps_lon, 6);
+}
+/* ----------------------------------------------------- Fin : Affichage des Mesures ----------------------------------------------------- */
+
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////// :: GESTION DES ERREURS :: //////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/* //////////////////////////////////////////////////// Début : Vérification des erreurs \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+ErreurType detecter_erreurs(Capteur* capteurs, Systeme* sys, float gps_lat, float gps_lon) {
+    // @Vérifie si des erreurs sont présents lors de l'exécution du système
+
+    //Vérifier le module RTC
+    if (!rtc_initialise) {
+        return ERREUR_RTC;
+    }
+    
+    //Vérifier les données GPS
+    if (isnan(gps_lat) || isnan(gps_lon)) {
+        return ERREUR_GPS;
+    }
+    
+    // Vérifier si un capteur est en erreur 
+    for (uint8_t i = 0; i < 4; i++) {
+        if ((sys->mode == MODE_STANDARD || capteurs[i].actif) && capteurs[i].erreur) {
+            return ERREUR_CAPTEUR;
+        }
+    }
+    
+    //Vérifier si un capteur à fourni une valeur incohérente
+    for (uint8_t i = 0; i < 4; i++) {
+        if (sys->mode == MODE_STANDARD || capteurs[i].actif) {
+            bool valeur_incoherente = false;
+            if (i == HUMIDITE) {
+                if (!isnan(capteurs[TEMPERATURE].mesure)) {
+                    if (capteurs[TEMPERATURE].mesure < capteurs[i].seuil_min || 
+                        capteurs[TEMPERATURE].mesure > capteurs[i].seuil_max) {
+                        return ERREUR_VALEUR_INCOHERENTE;
+                    }
+                }
+            } else {
+                if (capteurs[i].mesure < capteurs[i].seuil_min || 
+                    capteurs[i].mesure > capteurs[i].seuil_max) {
+                    return ERREUR_VALEUR_INCOHERENTE;
+                }
+            }
+        }
+    }
+    
+    //Vérifier que la carte SD est bien présente en mode standard et éco
+    if (!sys->sd_ok && sys->mode < MODE_CONFIG) {
+        return ERREUR_SD;
+    }
+
+    //Vérifier qu'il est bien possible d'écrire sur la carte Sd sinon c'est qu'elle est pleine
+    if (!sys->ecriture_sd && sys->mode < MODE_CONFIG) {
+        return ERREUR_ECRITURE;
+    }
+    
+    return AUCUNE_ERREUR;
+}
+/* ----------------------------------------------------- Fin : Vérification des erreurs ----------------------------------------------------- */
+
+
+/* //////////////////////////////////////////////////// Début : Affichage LED Erreur \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void gerer_affichage_erreur(Systeme* sys) {
+    // @Permet de faire clignoter la led selon un code couleur si une erreur est reconnue
+
+    static unsigned long dernier_changement = 0;
+    static bool etat_led = false;
+    
+    unsigned long maintenant = millis();
+    
+    //Si pas d'erreur, afficher la LED normale et sortir
+    if (sys->erreur_actuelle == AUCUNE_ERREUR) {
+        afficher_led(sys);
+        return;
+    }
+
+    //Faire clignoter selon le type d'erreur
+    if (maintenant - dernier_changement >= 100) { // Clignotement à 0.1s
+        etat_led = !etat_led;
+        dernier_changement = maintenant;
+        switch(sys->erreur_actuelle) {
+            case ERREUR_RTC: // Si erreur du module RTC alors cligner en Rouge et Bleu
+                if (etat_led) {
+                    led.setColorRGB(0, 255, 0, 0);
+                } else {
+                    led.setColorRGB(0, 0, 0, 255);
+                }
+                break;
+            case ERREUR_GPS: // Si erreur de la postion GPS alors clignoter en Rouge et Jaune
+                if (etat_led) {
+                    led.setColorRGB(0, 255, 0, 0);
+                } else {
+                    led.setColorRGB(0, 255, 255, 0);
+                }
+                break;
+            case ERREUR_CAPTEUR: // Si une erreur d'accès à un gps alors clignoter rouge et vert
+                if (etat_led) {
+                    led.setColorRGB(0, 255, 0, 0);
+                } else {
+                    led.setColorRGB(0, 0, 255, 0);
+                }
+                break;
+            case ERREUR_SD: // Si la carte SD n'est pas présente, alors clignoter rouge et blanc avec une durée 2 fois plus longue pour le blanc
+                if (etat_led) {
+                    led.setColorRGB(0, 255, 0, 0);
+                } else {
+                    led.setColorRGB(0, 255, 255, 255);
+                    delay(100);
+                }
+                break;
+            case ERREUR_VALEUR_INCOHERENTE: // Si une donnée est incogérente des capteurs alors clignoter rouge et vert avec une durée 2 fois plus longue pour le vert
+                if (etat_led) {
+                    led.setColorRGB(0, 255, 0, 0);
+                } else {
+                    led.setColorRGB(0, 0, 255, 0);
+                    delay(100);
+                }
+                break;
+            case ERREUR_ECRITURE: // Si il est impossible d'écrire, la carte SD est pleine alors cligner rouge et blanc
+                if (etat_led) {
+                    led.setColorRGB(0, 255, 0, 0);
+                } else {
+                    led.setColorRGB(0, 255, 255, 255);
+                }
+                break;
+            default:
+                afficher_led(sys);
+                break;
+        }
+    }
+}
+/* ----------------------------------------------------- Fin : Affichage LED erreur ----------------------------------------------------- */
+
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////// :: FONCTIONS MODE CONFIG :: /////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/* //////////////////////////////////////////////////// Début : Paramètres par défaut \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void reset(Capteur* capteurs, Systeme* sys, Config* config) {
+    // @Remettre par défaut les paramètres
+    for (int i = 0; i < EEPROM.length(); i++) EEPROM.write(i, 0);
+    
+    init_capt(capteurs);
+    save_capt(capteurs);
+    
+    sys->mode = MODE_STANDARD;
+    sys->mode_prec = MODE_STANDARD;
+    sys->ecriture_sd = sys->sd_ok = sys->alt_gps = true;
+    
+    config->log_interval = 10000;
+    config->timeout = 300000;
+    config->file_max = 2048;
+    save_systeme_config(config);
+    
+    afficher_led(sys);
+}
+/* ----------------------------------------------------- Fin : Paramètres par défaut ----------------------------------------------------- */
+
+
+/* //////////////////////////////////////////////////// Début : Traitement des commandes \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void traiter_commande(char* cmd, Capteur* capteurs, Systeme* sys, Config* config) {
+    // @Traiter les commandes entrées sur le monitor série
+
+    //Commandes simples
+    if (strcmp(cmd, "RESET") == 0) {
+        reset(capteurs, sys, config);
+        Serial.println(F("Reset OK"));
+        return;
+    }
+    if (strcmp(cmd, "VERSION") == 0) {
+        Serial.println(F("1.0 OPTIMISE"));
+        return;
+    }
+    
+    //Tableau des commandes avec leurs propriétés
+    struct CmdDef {
+        const char* prefix;
+        uint8_t len;
+        uint8_t capteur_idx;
+        uint8_t action; // 0=actif, 1=min, 2=max, 3=log_interval, 4=file_max, 5=timeout
+    };
+    
+    static const CmdDef commands[] PROGMEM = {
+        {"LOG_INTERVAL=", 13, 0, 3},
+        {"FILE_MAX_SIZE=", 14, 0, 4},
+        {"TIMEOUT=", 8, 0, 5},
+        {"LUMIN=", 6, 0, 0}, {"LUMIN_LOW=", 10, 0, 1}, {"LUMIN_HIGH=", 11, 0, 2},
+        {"TEMP_AIR=", 9, 1, 0}, {"MIN_TEMP_AIR=", 13, 1, 1}, {"MAX_TEMP_AIR=", 13, 1, 2},
+        {"HYGR=", 5, 2, 0}, {"HYGR_MINT=", 10, 2, 1}, {"HYGR_MAXT=", 10, 2, 2},
+        {"PRESSURE=", 9, 3, 0}, {"PRESSURE_MIN=", 13, 3, 1}, {"PRESSURE_MAX=", 13, 3, 2}
+    };
+    
+    for (uint8_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        CmdDef def;
+        memcpy_P(&def, &commands[i], sizeof(def));
+        
+        if (strncmp(cmd, def.prefix, def.len) == 0) {
+            float val = atof(cmd + def.len);
+            
+            switch (def.action) {
+                case 0: capteurs[def.capteur_idx].actif = (bool)val; break;
+                case 1: capteurs[def.capteur_idx].seuil_min = val; break;
+                case 2: capteurs[def.capteur_idx].seuil_max = val; break;
+                case 3: config->log_interval = (uint16_t)val; save_systeme_config(config); break;
+                case 4: config->file_max = (uint16_t)val; save_systeme_config(config); break;
+                case 5: config->timeout = (uint16_t)val; save_systeme_config(config); break;
+            }
+            
+            if (def.action < 3) save_capt(capteurs);
+            
+            Serial.println(F("OK"));
+            return;
+        }
+    }
+    
+    Serial.println(F("Commande inconnue"));
+}
+/* ----------------------------------------------------- Fin : Traitement des commandes ----------------------------------------------------- */
+
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////// :: INTERRUPTIONS :: //////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+/* //////////////////////////////////////////////////// Début : Interruption Bouton Rouge \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void isr_rouge() {
+    // @Fonction appelé par l'interruption du bouton rouge
+    if (digitalRead(BTN_ROUGE) == LOW) {
+        sys_global.t_rouge = millis();
+        sys_global.btn_rouge = true;
+    } else {
+        sys_global.btn_rouge = false;
+    }
+}
+/* ----------------------------------------------------- Fin : Interruption Bouton Rouge ----------------------------------------------------- */
+
+
+/* //////////////////////////////////////////////////// Début : Interruption Bouton Vert \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ */
+void isr_vert() {
+    // @Fonction appelé par l'interruption du bouton vert
+    if (digitalRead(BTN_VERT) == LOW) {
+        sys_global.t_vert = millis();
+        sys_global.btn_vert = true;
+    } else {
+        sys_global.btn_vert = false;
+    }
+}
+/* ----------------------------------------------------- Fin : Interruption Bouton Vert ----------------------------------------------------- */
