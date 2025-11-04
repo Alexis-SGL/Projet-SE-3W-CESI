@@ -25,8 +25,6 @@ Plusieurs sociétés de transport maritime ont accepté d’équiper leurs navir
 - **efficaces**,  
 - **pilotables par un membre d’équipage** à l’aide d’une **documentation technique utilisateur**.
 
-Une startup partenaire a été choisie pour la **conception du prototype**.
-
 ---
 
 ## ⚙️ Ressources et matériel
@@ -39,9 +37,9 @@ Une startup partenaire a été choisie pour la **conception du prototype**.
 - **2 boutons poussoirs (numériques)** → interaction avec le système
 
 ### 🌡️ Capteurs
-- Pression atmosphérique (I2C ou SPI)
-- Température de l’air (I2C ou SPI)
-- Hygrométrie (I2C ou SPI)
+- Pression atmosphérique (I2C)
+- Température de l’air (I2C)
+- Hygrométrie (I2C)
 - GPS (UART)
 - Luminosité (analogique)
 
