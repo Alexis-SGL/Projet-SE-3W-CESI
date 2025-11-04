@@ -47,3 +47,9 @@ Une startup partenaire a été choisie pour la **conception du prototype**.
 
 ![Photo-Montage-CarteArduino](https://github.com/user-attachments/assets/112b3599-1fb2-40b1-9728-387c1b513694)
 
+## ⚙️ Les fonctionnalités clés du système
+
+- 🟢 **Mode Standard (LED verte)** : fonctionnement normal. Acquisition complète et enregistrement sur la carte SD de toutes les données à intervalles réguliers.  
+- 🔵 **Mode Économique (LED bleue)** : optimisation de la batterie 🔋. L’intervalle de mesure est doublé et l’acquisition GPS n’est effectuée qu’une fois sur deux.  
+- 🟡 **Mode Configuration (LED jaune)** : mode technicien (accessible au démarrage) permettant de régler les paramètres du système et des capteurs (seuils, intervalles) via le moniteur série.  
+- 🟠 **Mode Maintenance (LED orange)** : mode technicien qui suspend l’écriture sur la carte SD pour permettre son retrait en toute sécurité et la consultation des données en direct sur le moniteur série.  
