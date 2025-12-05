@@ -1,4 +1,4 @@
-<img src="https://github.com/user-attachments/assets/14f92d9c-cd22-4b7d-b6be-ed5ceb1216b8" alt="Logo 3W" width="100" align="right" />
+<img src="https://github.com/user-attachments/assets/311a3983-f518-4410-8429-bc025f07f575" alt="Logo 3W" width="100" align="right" />
 <br><br>
 
 
@@ -50,4 +50,8 @@ Plusieurs sociétés de transport maritime ont accepté d’équiper leurs navir
 - 🟢 **Mode Standard (LED verte)** : fonctionnement normal. Acquisition complète et enregistrement sur la carte SD de toutes les données à intervalles réguliers.  
 - 🔵 **Mode Économique (LED bleue)** : optimisation de la batterie 🔋. L’intervalle de mesure est doublé et l’acquisition GPS n’est effectuée qu’une fois sur deux.  
 - 🟡 **Mode Configuration (LED jaune)** : mode technicien (accessible au démarrage) permettant de régler les paramètres du système et des capteurs (seuils, intervalles) via le moniteur série.  
-- 🟠 **Mode Maintenance (LED orange)** : mode technicien qui suspend l’écriture sur la carte SD pour permettre son retrait en toute sécurité et la consultation des données en direct sur le moniteur série.  
+- 🟠 **Mode Maintenance (LED orange)** : mode technicien qui suspend l’écriture sur la carte SD pour permettre son retrait en toute sécurité et la consultation des données en direct sur le moniteur série.
+
+
+---
+Projet réalisé dans le cadre du module SE (Systèmes Embarqués) de l'école d'ingénieurs CESI.
