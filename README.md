@@ -4,6 +4,8 @@
 
 # 🌍 Projet 3W – Worldwide Weather Watcher
 
+![C++](https://img.shields.io/badge/C++-17-blue.svg) ![Arduino](https://img.shields.io/badge/Arduino-1.8-orange.svg) 
+
 ## 🧭 Introduction
 Le projet **3W (Worldwide Weather Watcher)** consiste à concevoir un **prototype de station météo embarquée** destinée à équiper des navires.  
 Ces stations permettront, à long terme, **d’échanger des données météorologiques** afin de **prévoir des catastrophes naturelles** telles que les cyclones.
